@@ -1,145 +1,209 @@
 package authorizer
 
 import (
+	"crypto/subtle"
 	"errors"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/akshonesports/go-jwks"
 	"github.com/dgrijalva/jwt-go"
 )
 
-// Config is the options for an Authorizer.
-type Config struct {
-	// Audience is the expected token audience
-	//
-	// If this value is not empty, authorization will fail if the token
-	// audience does not match this value.
-	Audience string
+const defaultHeader = "Authorization"
 
-	// Issuer is the expected token issuer.
-	//
-	// If this value is not empty, authorization will fail if the token issuer
-	// does not match this value.
-	Issuer string
+var (
+	ErrInvalidAudience = errors.New("invalid audience")
+	ErrInvalidIssuer   = errors.New("invalid issuer")
+	ErrBadAlgorithm    = errors.New("algorithm not allowed")
+	ErrInvalidHeader   = errors.New("invalid authorization header")
+	ErrMissingHeader   = errors.New("missing authorization header")
+)
 
-	// Algorithms is a whitelist of algorithms used to verify a token.
-	//
-	// If this value is not empty, authorization will fail if the token
-	// algorithm is not one the whitelisted values.
-	Algorithms []jwks.Algorithm
+// Option is an option for an Authorizer.
+type Option func(*Authorizer)
 
-	// Keys is the set of JWKs.
-	Keys jwks.JSONWebKeySet
+// WithAudience returns an authorizer option for audience.
+func WithAudience(aud string) Option {
+	return func(authorizer *Authorizer) {
+		authorizer.Audience = aud
+	}
+}
+
+// WithIssuer returns an authorizer option for issuer.
+func WithIssuer(iss string) Option {
+	return func(authorizer *Authorizer) {
+		authorizer.Issuer = iss
+	}
+}
+
+// WithAlgorithms returns an authorizer option for algorithms.
+func WithAlgorithms(algs ...jwks.Algorithm) Option {
+	return func(authorizer *Authorizer) {
+		authorizer.Algorithms = algs
+	}
+}
+
+// WithHeader returns an authorizer option for header.
+func WithHeader(header string) Option {
+	return func(authorizer *Authorizer) {
+		authorizer.Header = header
+	}
 }
 
 // Authorizer is an http.Handler that authenticates HTTP requests.
 type Authorizer struct {
-	config Config
-	next   http.Handler
+	keys jwks.JSONWebKeySet
+	next http.Handler
+
+	// Audience is the expected token audience.
+	//
+	// Authorization will fail if the token audience does not match this value.
+	//
+	// Leave this value empty to allow any audience value.
+	Audience string
+
+	// Issuer is the expected token issuer.
+	//
+	// Authorization will fail if the token issuer does not match this value.
+	//
+	// Leave this value empty to allow any issuer value.
+	Issuer string
+
+	// Algorithms is a whitelist of algorithms used to verify a token.
+	//
+	// Authorization will fail if the token algorithm is not one the given
+	// values.
+	//
+	// Leave this value empty to allow any algorithm.
+	Algorithms []jwks.Algorithm
+
+	// Header is the authorization header.
+	//
+	// Leave this value empty to use "Authorization".
+	Header string
 }
 
 // New creates a new Authorizer with an http.Handler.
-func New(config Config, handler http.Handler) *Authorizer {
-	return &Authorizer{
-		config: config,
-		next:   handler,
+func New(ks jwks.JSONWebKeySet, handler http.Handler, options ...Option) *Authorizer {
+	authorizer := &Authorizer{
+		keys: ks,
+		next: handler,
 	}
+
+	for _, apply := range options {
+		apply(authorizer)
+	}
+
+	return authorizer
 }
 
-// New creates a new Authorizer with an http.HandlerFunc.
-func NewFunc(config Config, handler http.HandlerFunc) *Authorizer {
-	return &Authorizer{
-		config: config,
-		next:   handler,
-	}
+// Func creates a new Authorizer with an http.HandlerFunc.
+func Func(ks jwks.JSONWebKeySet, handler http.HandlerFunc, options ...Option) *Authorizer {
+	return New(ks, handler, options...)
 }
 
 func (a *Authorizer) keyfunc(token *jwt.Token) (interface{}, error) {
-	kid, ok := token.Header["kid"]
-	if !ok {
-		return nil, errors.New("missing key id")
+	keyID, _ := token.Header["kid"].(string)
+	key, err := a.keys.Key(keyID)
+	if err != nil {
+		return nil, err
 	}
 
-	keyID, ok := kid.(string)
-	if !ok {
-		return nil, errors.New("invalid key id")
-	}
-
-	if a.config.Keys == nil {
-		return nil, errors.New("unknown key id")
-	}
-
-	key, ok := a.config.Keys[keyID]
-	if !ok {
-		return nil, errors.New("unknown key id")
-	}
-
-	if len(a.config.Algorithms) == 0 {
+	if len(a.Algorithms) == 0 {
 		return key.Key, nil
 	}
 
-	alg, ok := token.Header["alg"]
-	if !ok {
-		return nil, errors.New("missing algorithm value")
-	}
-
-	algorithm, ok := alg.(string)
-	if !ok {
-		return nil, errors.New("invalid algorithm value")
-	}
-
-	for _, algo := range a.config.Algorithms {
-		if string(algo) == algorithm {
+	alg, _ := token.Header["alg"].(string)
+	for _, algo := range a.Algorithms {
+		if string(algo) == alg {
 			return key.Key, nil
 		}
 	}
 
-	return nil, errors.New("algorithm not allowed")
+	return nil, ErrBadAlgorithm
+}
+
+func (a *Authorizer) validate(authorizationHeader string) (map[string]interface{}, error) {
+	if authorizationHeader == "" {
+		return nil, ErrMissingHeader
+	}
+
+	if !strings.HasPrefix(authorizationHeader, "Bearer ") {
+		return nil, ErrInvalidHeader
+	}
+
+	claims := make(jwt.MapClaims)
+	if _, err := jwt.ParseWithClaims(authorizationHeader[7:], claims, a.keyfunc); err != nil {
+		return nil, err
+	}
+
+	if a.Issuer != "" && !claims.VerifyIssuer(a.Issuer, true) {
+		return claims, ErrInvalidIssuer
+	}
+
+	if a.Audience != "" && !verifyAud(claims["aud"], a.Audience) {
+		return claims, ErrInvalidAudience
+	}
+
+	if err := claims.Valid(); err != nil {
+		return claims, err
+	}
+
+	return claims, nil
+}
+
+func verifyAud(aud interface{}, expected string) bool {
+	switch aud := aud.(type) {
+	case []string:
+		for _, aud := range aud {
+			if subtle.ConstantTimeCompare([]byte(expected), []byte(aud)) == 1 {
+				return false
+			}
+		}
+	case string:
+		if subtle.ConstantTimeCompare([]byte(expected), []byte(aud)) == 0 {
+			return false
+		}
+	}
+
+	return true
 }
 
 // ServerHTTP authenticates the HTTP request.
 func (a *Authorizer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	authorizationHeader := r.Header.Get("Authorization")
-	if authorizationHeader == "" {
-		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
-		return
+	header := a.Header
+	if header == "" {
+		header = defaultHeader
 	}
 
-	if !strings.HasPrefix(authorizationHeader, "Bearer ") {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
+	claims, err := a.validate(r.Header.Get(header))
+	a.next.ServeHTTP(w, r.WithContext(withResult(r.Context(), claims, err)))
+}
+
+// ErrorHandler returns a http.Handler that handles authorizer errors.
+func ErrorHandler(next http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		err := Error(r.Context())
+		if _, ok := err.(*jwt.ValidationError); ok {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+
+		switch err {
+		case ErrMissingHeader, ErrInvalidIssuer, ErrInvalidAudience:
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+		case ErrInvalidHeader:
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		default:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		case nil:
+			next.ServeHTTP(w, r)
+		}
 	}
+}
 
-	var claims jwt.StandardClaims
-	if _, err := jwt.ParseWithClaims(authorizationHeader[7:], &claims, a.keyfunc); err != nil {
-		goto Unauthorized
-	}
-
-	if a.config.Issuer != "" && claims.Issuer != a.config.Issuer {
-		// fmt.Println("invalid issuer")
-		goto Unauthorized
-	}
-
-	if a.config.Audience != "" && claims.Audience != a.config.Audience {
-		// fmt.Println("invalid audience")
-		goto Unauthorized
-	}
-
-	if time.Unix(claims.IssuedAt, 0).After(time.Now()) {
-		// fmt.Println("token not valid yet")
-		goto Unauthorized
-	}
-
-	if time.Unix(claims.ExpiresAt, 0).Before(time.Now()) {
-		// fmt.Println("token expired")
-		goto Unauthorized
-	}
-
-	a.next.ServeHTTP(w, r)
-	return
-
-Unauthorized:
-	http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+// ErrorHandlerFunc is the same as ErrorHandler for http.HandlerFunc.
+func ErrorHandlerFunc(next http.HandlerFunc) http.HandlerFunc {
+	return ErrorHandler(next)
 }

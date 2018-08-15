@@ -55,9 +55,20 @@ if !ok {
 An HTTP Middleware is included for simple request authorization.
 
 ```
-http.ListenAndServe("", authorizer.NewFunc(authorizer.Config{
-	Keys: keys,
-}, func(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintln(w, "Authorization Successful!")
+http.ListenAndServe("", authorizer.New(keys, authorizer.ErrorHandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "Hello", authorizer.Claims(r.Context())["sub"])
+})))
+```
+
+or you can handle the authorization errors yourself:
+
+```
+http.ListenAndServe("", authorizer.Func(keys, func(w http.ResponseWriter, r *http.Request) {
+	if err := authorizer.Error(r.Context()); err != nil {
+		http.Error(w, "You're not allowed! >:[", http.StatusUnauthorized)
+		return
+	}
+
+	fmt.Fprintln(w, "Hello", authorizer.Claims(r.Context())["sub"])
 }))
 ```
