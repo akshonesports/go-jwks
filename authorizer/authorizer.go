@@ -124,17 +124,21 @@ func (a *Authorizer) keyfunc(token *jwt.Token) (interface{}, error) {
 	return nil, ErrBadAlgorithm
 }
 
-func (a *Authorizer) validate(authorizationHeader string) (map[string]interface{}, error) {
+func (a *Authorizer) token(authorizationHeader string) (string, error) {
 	if authorizationHeader == "" {
-		return nil, ErrMissingHeader
+		return "", ErrMissingHeader
 	}
 
 	if !strings.HasPrefix(authorizationHeader, "Bearer ") {
-		return nil, ErrInvalidHeader
+		return "", ErrInvalidHeader
 	}
 
+	return authorizationHeader[7:], nil
+}
+
+func (a *Authorizer) validate(token string) (map[string]interface{}, error) {
 	claims := make(jwt.MapClaims)
-	if _, err := jwt.ParseWithClaims(authorizationHeader[7:], claims, a.keyfunc); err != nil {
+	if _, err := jwt.ParseWithClaims(token, claims, a.keyfunc); err != nil {
 		return nil, err
 	}
 
@@ -177,8 +181,26 @@ func (a *Authorizer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		header = defaultHeader
 	}
 
-	claims, err := a.validate(r.Header.Get(header))
-	a.next.ServeHTTP(w, r.WithContext(withResult(r.Context(), claims, err)))
+	ctx := r.Context()
+	defer func() {
+		a.next.ServeHTTP(w, r.WithContext(ctx))
+	}()
+
+	token, err := a.token(r.Header.Get(header))
+	if err != nil {
+		ctx = setError(ctx, err)
+		return
+	}
+
+	ctx = setToken(ctx, token)
+
+	claims, err := a.validate(token)
+	if err != nil {
+		ctx = setError(ctx, err)
+		return
+	}
+
+	ctx = setClaims(ctx, claims)
 }
 
 // ErrorHandler returns a http.Handler that handles authorizer errors.

@@ -3,28 +3,59 @@ package authorizer
 import (
 	"context"
 
-	"github.com/dgrijalva/jwt-go"
 )
 
 type contextKey string
 
 const (
-	claimsCtxKey contextKey = "authorizer jwt claims"
-	errorCtxKey  contextKey = "authorizer error"
+	resultsCtxKey contextKey = "akshonesports authorizer result"
 )
 
-func withResult(ctx context.Context, claims jwt.MapClaims, err error) context.Context {
-	ctx = context.WithValue(ctx, claimsCtxKey, map[string]interface{}(claims))
-	ctx = context.WithValue(ctx, errorCtxKey, err)
+type result struct {
+	token string
+	claims map[string]interface{}
+	err error
+}
+
+func setToken(ctx context.Context, token string) context.Context {
+	ctx, res := getResult(ctx)
+	res.token = token
 	return ctx
 }
 
+func setClaims(ctx context.Context, claims map[string]interface{}) context.Context {
+	ctx, res := getResult(ctx)
+	res.claims = claims
+	return ctx
+}
+
+func setError(ctx context.Context, err error) context.Context {
+	ctx, res := getResult(ctx)
+	res.err = err
+	return ctx
+}
+
+func getResult(ctx context.Context) (context.Context, *result) {
+	res, _ := ctx.Value(resultsCtxKey).(*result)
+	if res != nil {
+		return ctx, res
+	}
+
+	res = &result{}
+	return context.WithValue(ctx, resultsCtxKey, res), res
+}
+
+func Token(ctx context.Context) string {
+	_, res := getResult(ctx)
+	return res.token
+}
+
 func Claims(ctx context.Context) map[string]interface{} {
-	claims, _ := ctx.Value(claimsCtxKey).(map[string]interface{})
-	return claims
+	_, res := getResult(ctx)
+	return res.claims
 }
 
 func Error(ctx context.Context) error {
-	err, _ := ctx.Value(errorCtxKey).(error)
-	return err
+	_, res := getResult(ctx)
+	return res.err
 }
