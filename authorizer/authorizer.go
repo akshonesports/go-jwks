@@ -103,6 +103,13 @@ func Func(ks jwks.JSONWebKeySet, handler http.HandlerFunc, options ...Option) *A
 	return New(ks, handler, options...)
 }
 
+// Middleware returns an http middleware function.
+func Middleware(ks jwks.JSONWebKeySet, options ...Option) func(http.Handler) http.Handler {
+	return func(handler http.Handler) http.Handler {
+		return New(ks, handler, options...)
+	}
+}
+
 func (a *Authorizer) keyfunc(token *jwt.Token) (interface{}, error) {
 	keyID, _ := token.Header["kid"].(string)
 	key, err := a.keys.Key(keyID)
@@ -204,8 +211,8 @@ func (a *Authorizer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // ErrorHandler returns a http.Handler that handles authorizer errors.
-func ErrorHandler(next http.Handler) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func ErrorHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		err := Error(r.Context())
 		if _, ok := err.(*jwt.ValidationError); ok {
 			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
@@ -222,10 +229,10 @@ func ErrorHandler(next http.Handler) http.HandlerFunc {
 		case nil:
 			next.ServeHTTP(w, r)
 		}
-	}
+	})
 }
 
 // ErrorHandlerFunc is the same as ErrorHandler for http.HandlerFunc.
-func ErrorHandlerFunc(next http.HandlerFunc) http.HandlerFunc {
+func ErrorHandlerFunc(next http.HandlerFunc) http.Handler {
 	return ErrorHandler(next)
 }
