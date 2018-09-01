@@ -18,6 +18,7 @@ var (
 	ErrBadAlgorithm    = errors.New("algorithm not allowed")
 	ErrInvalidHeader   = errors.New("invalid authorization header")
 	ErrMissingHeader   = errors.New("missing authorization header")
+	ErrMissingToken    = errors.New("missing authorization token")
 )
 
 // Option is an option for an Authorizer.
@@ -51,6 +52,15 @@ func WithHeader(header string) Option {
 	}
 }
 
+// WithTokenFunc returns an authorizer option for header.
+func WithTokenFunc(tokenFunc TokenFunc) Option {
+	return func(authorizer *Authorizer) {
+		authorizer.TokenFunc = tokenFunc
+	}
+}
+
+type TokenFunc func(r *http.Request) string
+
 // Authorizer is an http.Handler that authenticates HTTP requests.
 type Authorizer struct {
 	keys jwks.JSONWebKeySet
@@ -82,6 +92,9 @@ type Authorizer struct {
 	//
 	// Leave this value empty to use "Authorization".
 	Header string
+
+	// TokenFunc is a function that returns the token from the http.Request
+	TokenFunc TokenFunc
 }
 
 // New creates a new Authorizer with an http.Handler.
@@ -131,16 +144,33 @@ func (a *Authorizer) keyfunc(token *jwt.Token) (interface{}, error) {
 	return nil, ErrBadAlgorithm
 }
 
-func (a *Authorizer) token(authorizationHeader string) (string, error) {
-	if authorizationHeader == "" {
-		return "", ErrMissingHeader
+func (a *Authorizer) token(r *http.Request) (string, error) {
+	var token string
+	if a.TokenFunc != nil {
+		token = a.TokenFunc(r)
+	} else {
+		header := a.Header
+		if header == "" {
+			header = defaultHeader
+		}
+
+		authorizationHeader := r.Header.Get(header)
+		if authorizationHeader == "" {
+			return "", ErrMissingHeader
+		}
+
+		if !strings.HasPrefix(authorizationHeader, "Bearer ") {
+			return "", ErrInvalidHeader
+		}
+
+		token = authorizationHeader[7:]
 	}
 
-	if !strings.HasPrefix(authorizationHeader, "Bearer ") {
-		return "", ErrInvalidHeader
+	if token == "" {
+		return "", ErrMissingToken
 	}
 
-	return authorizationHeader[7:], nil
+	return token, nil
 }
 
 func (a *Authorizer) validate(token string) (map[string]interface{}, error) {
@@ -183,17 +213,12 @@ func verifyAud(aud interface{}, expected string) bool {
 
 // ServerHTTP authenticates the HTTP request.
 func (a *Authorizer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	header := a.Header
-	if header == "" {
-		header = defaultHeader
-	}
-
 	ctx := r.Context()
 	defer func() {
 		a.next.ServeHTTP(w, r.WithContext(ctx))
 	}()
 
-	token, err := a.token(r.Header.Get(header))
+	token, err := a.token(r)
 	if err != nil {
 		ctx = setError(ctx, err)
 		return
