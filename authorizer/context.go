@@ -35,6 +35,10 @@ func setError(ctx context.Context, err error) context.Context {
 	return ctx
 }
 
+func setResult(ctx context.Context, res *result) context.Context {
+	return context.WithValue(ctx, resultsCtxKey, res)
+}
+
 func getResult(ctx context.Context) (context.Context, *result) {
 	res, _ := ctx.Value(resultsCtxKey).(*result)
 	if res != nil {
@@ -42,7 +46,7 @@ func getResult(ctx context.Context) (context.Context, *result) {
 	}
 
 	res = &result{}
-	return context.WithValue(ctx, resultsCtxKey, res), res
+	return setResult(ctx, res), res
 }
 
 func Token(ctx context.Context) string {

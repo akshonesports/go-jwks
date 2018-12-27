@@ -1,10 +1,14 @@
 package authorizer
 
 import (
+	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/akshonesports/go-jwks"
 	"github.com/dgrijalva/jwt-go"
@@ -66,6 +70,9 @@ type Authorizer struct {
 	keys jwks.JSONWebKeySet
 	next http.Handler
 
+	mu    sync.RWMutex
+	cache map[string]*result
+
 	// Audience is the expected token audience.
 	//
 	// Authorization will fail if the token audience does not match this value.
@@ -102,6 +109,7 @@ func New(ks jwks.JSONWebKeySet, handler http.Handler, options ...Option) *Author
 	authorizer := &Authorizer{
 		keys: ks,
 		next: handler,
+		cache: make(map[string]*result),
 	}
 
 	for _, apply := range options {
@@ -211,6 +219,43 @@ func verifyAud(aud interface{}, expected string) bool {
 	return true
 }
 
+func (a *Authorizer) check(token string) *result {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	return a.cache[token]
+}
+
+func (a *Authorizer) prime(ctx context.Context) {
+	_, res := getResult(ctx)
+	exp, ok := res.claims["exp"].(json.Number)
+	if !ok {
+		return
+	}
+
+	t, err := exp.Int64()
+	if err != nil {
+		return
+	}
+
+	expiresIn := time.Unix(t, 0).Sub(time.Now())
+	if expiresIn <= 0 {
+		return
+	}
+
+	time.AfterFunc(expiresIn, func() {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+
+		delete(a.cache, res.token)
+	})
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	a.cache[res.token] = res
+}
+
 // ServerHTTP authenticates the HTTP request.
 func (a *Authorizer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -224,6 +269,11 @@ func (a *Authorizer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if res := a.check(token); res != nil {
+		ctx = setResult(ctx, res)
+		return
+	}
+
 	ctx = setToken(ctx, token)
 
 	claims, err := a.validate(token)
@@ -233,6 +283,8 @@ func (a *Authorizer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx = setClaims(ctx, claims)
+
+	a.prime(ctx)
 }
 
 // ErrorHandler returns a http.Handler that handles authorizer errors.
