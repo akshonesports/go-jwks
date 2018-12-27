@@ -149,7 +149,7 @@ func FromURL(url string) (JSONWebKeySet, error) {
 	return FromReader(resp.Body)
 }
 
-// FromURL decodes the data from the given reader as a JWK Set.
+// FromReader decodes the data from the given reader as a JWK Set.
 func FromReader(reader io.Reader) (JSONWebKeySet, error) {
 	var keyList struct {
 		Keys []*JSONWebKey `json:"keys"`
