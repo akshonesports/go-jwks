@@ -181,7 +181,7 @@ func (a *Authorizer) token(r *http.Request) (string, error) {
 	return token, nil
 }
 
-func (a *Authorizer) validate(token string) (map[string]interface{}, error) {
+func (a *Authorizer) Validate(token string) (map[string]interface{}, error) {
 	claims := make(jwt.MapClaims)
 	if _, err := jwt.ParseWithClaims(token, claims, a.keyfunc); err != nil {
 		return nil, err
@@ -276,7 +276,7 @@ func (a *Authorizer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	ctx = setToken(ctx, token)
 
-	claims, err := a.validate(token)
+	claims, err := a.Validate(token)
 	if err != nil {
 		ctx = setError(ctx, err)
 		return
