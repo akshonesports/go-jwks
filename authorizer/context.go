@@ -5,11 +5,7 @@ import (
 
 )
 
-type contextKey string
-
-const (
-	resultsCtxKey contextKey = "akshonesports authorizer result"
-)
+type contextKey struct{}
 
 type result struct {
 	token string
@@ -36,11 +32,11 @@ func setError(ctx context.Context, err error) context.Context {
 }
 
 func setResult(ctx context.Context, res *result) context.Context {
-	return context.WithValue(ctx, resultsCtxKey, res)
+	return context.WithValue(ctx, contextKey{}, res)
 }
 
 func getResult(ctx context.Context) (context.Context, *result) {
-	res, _ := ctx.Value(resultsCtxKey).(*result)
+	res, _ := ctx.Value(contextKey{}).(*result)
 	if res != nil {
 		return ctx, res
 	}

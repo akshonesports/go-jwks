@@ -25,139 +25,143 @@ var (
 	ErrMissingToken    = errors.New("missing authorization token")
 )
 
+type options struct {
+	aud  string
+	iss  string
+	algs []jwks.Algorithm
+
+	handlerOptions []HandlerOption
+}
+
+func readOptions(opts []Option) *options {
+	o := new(options)
+	for _, apply := range opts {
+		apply(o)
+	}
+	return o
+}
+
 // Option is an option for an Authorizer.
-type Option func(*Authorizer)
+type Option func(*options)
 
 // WithAudience returns an authorizer option for audience.
+//
+// Audience is the expected token audience.
+//
+// Authorization will fail if the token audience does not match this value.
+//
+// Leave this value empty to allow any audience value.
 func WithAudience(aud string) Option {
-	return func(authorizer *Authorizer) {
-		authorizer.Audience = aud
+	return func(opts *options) {
+		opts.aud = aud
 	}
 }
 
 // WithIssuer returns an authorizer option for issuer.
+//
+// Issuer is the expected token issuer.
+//
+// Authorization will fail if the token issuer does not match this value.
+//
+// Leave this value empty to allow any issuer value.
 func WithIssuer(iss string) Option {
-	return func(authorizer *Authorizer) {
-		authorizer.Issuer = iss
+	return func(opts *options) {
+		opts.iss = iss
 	}
 }
 
 // WithAlgorithms returns an authorizer option for algorithms.
+//
+// Algorithms is a whitelist of algorithms used to verify a token.
+//
+// Authorization will fail if the token algorithm is not one the given
+// values.
+//
+// Leave this value empty to allow any algorithm.
 func WithAlgorithms(algs ...jwks.Algorithm) Option {
-	return func(authorizer *Authorizer) {
-		authorizer.Algorithms = algs
+	return func(authorizer *options) {
+		authorizer.algs = algs
 	}
 }
 
+// WithHandlerOptions returns an authorizer option for handler options.
+func WithHandlerOptions(hopts ...HandlerOption) Option {
+	return func(opts *options) {
+		opts.handlerOptions = hopts
+	}
+}
+
+type HandlerOption func(*handler)
+
 // WithHeader returns an authorizer option for header.
-func WithHeader(header string) Option {
-	return func(authorizer *Authorizer) {
-		authorizer.Header = header
+//
+// Header is the authorization header.
+//
+// Leave this value empty to use "Authorization".
+func WithHeader(header string) HandlerOption {
+	return func(h *handler) {
+		h.header = header
 	}
 }
 
 // WithTokenFunc returns an authorizer option for header.
-func WithTokenFunc(tokenFunc TokenFunc) Option {
-	return func(authorizer *Authorizer) {
-		authorizer.TokenFunc = tokenFunc
+//
+// TokenFunc is a function that returns the token from the http.Request
+func WithTokenFunc(tokenFunc TokenFunc) HandlerOption {
+	return func(h *handler) {
+		h.tokenFunc = tokenFunc
 	}
 }
 
+// TokenFunc extracts a token from an *http.Request
 type TokenFunc func(r *http.Request) string
 
-// Authorizer is an http.Handler that authenticates HTTP requests.
-type Authorizer struct {
-	keys jwks.JSONWebKeySet
+type handler struct {
+	*Authorizer
+
 	next http.Handler
 
-	mu    sync.RWMutex
-	cache map[string]*result
-
-	// Audience is the expected token audience.
-	//
-	// Authorization will fail if the token audience does not match this value.
-	//
-	// Leave this value empty to allow any audience value.
-	Audience string
-
-	// Issuer is the expected token issuer.
-	//
-	// Authorization will fail if the token issuer does not match this value.
-	//
-	// Leave this value empty to allow any issuer value.
-	Issuer string
-
-	// Algorithms is a whitelist of algorithms used to verify a token.
-	//
-	// Authorization will fail if the token algorithm is not one the given
-	// values.
-	//
-	// Leave this value empty to allow any algorithm.
-	Algorithms []jwks.Algorithm
-
-	// Header is the authorization header.
-	//
-	// Leave this value empty to use "Authorization".
-	Header string
-
-	// TokenFunc is a function that returns the token from the http.Request
-	TokenFunc TokenFunc
+	header    string
+	tokenFunc TokenFunc
 }
 
-// New creates a new Authorizer with an http.Handler.
-func New(ks jwks.JSONWebKeySet, handler http.Handler, options ...Option) *Authorizer {
-	authorizer := &Authorizer{
-		keys: ks,
-		next: handler,
-		cache: make(map[string]*result),
-	}
+// ServerHTTP authenticates the HTTP request.
+func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	defer func() {
+		h.next.ServeHTTP(w, r.WithContext(ctx))
+	}()
 
-	for _, apply := range options {
-		apply(authorizer)
-	}
-
-	return authorizer
-}
-
-// Func creates a new Authorizer with an http.HandlerFunc.
-func Func(ks jwks.JSONWebKeySet, handler http.HandlerFunc, options ...Option) *Authorizer {
-	return New(ks, handler, options...)
-}
-
-// Middleware returns an http middleware function.
-func Middleware(ks jwks.JSONWebKeySet, options ...Option) func(http.Handler) http.Handler {
-	return func(handler http.Handler) http.Handler {
-		return New(ks, handler, options...)
-	}
-}
-
-func (a *Authorizer) keyfunc(token *jwt.Token) (interface{}, error) {
-	keyID, _ := token.Header["kid"].(string)
-	key, err := a.keys.Key(keyID)
+	token, err := h.token(r)
 	if err != nil {
-		return nil, err
+		ctx = setError(ctx, err)
+		return
 	}
 
-	if len(a.Algorithms) == 0 {
-		return key.Key, nil
+	if res := h.check(token); res != nil {
+		ctx = setResult(ctx, res)
+		return
 	}
 
-	alg, _ := token.Header["alg"].(string)
-	for _, algo := range a.Algorithms {
-		if string(algo) == alg {
-			return key.Key, nil
-		}
+	ctx = setToken(ctx, token)
+
+	claims, err := h.Validate(token)
+	if err != nil {
+		ctx = setError(ctx, err)
+		return
 	}
 
-	return nil, ErrBadAlgorithm
+	ctx = setClaims(ctx, claims)
+
+	h.prime(ctx)
 }
 
-func (a *Authorizer) token(r *http.Request) (string, error) {
+func (h *handler) token(r *http.Request) (string, error) {
 	var token string
-	if a.TokenFunc != nil {
-		token = a.TokenFunc(r)
+	if h.tokenFunc != nil {
+		token = h.tokenFunc(r)
 	} else {
-		header := a.Header
+		header := h.header
 		if header == "" {
 			header = defaultHeader
 		}
@@ -181,17 +185,105 @@ func (a *Authorizer) token(r *http.Request) (string, error) {
 	return token, nil
 }
 
+// Authorizer is an http.Handler that authenticates HTTP requests.
+type Authorizer struct {
+	keys jwks.JSONWebKeySet
+
+	mu    sync.RWMutex
+	cache map[string]*result
+
+	aud  string
+	iss  string
+	algs []jwks.Algorithm
+}
+
+func createAuthorizer(ks jwks.JSONWebKeySet, opts *options) *Authorizer {
+	return &Authorizer{
+		keys:  ks,
+		cache: make(map[string]*result),
+		aud:   opts.aud,
+		iss:   opts.iss,
+		algs:  opts.algs,
+	}
+}
+
+// New creates a new Authorizer.
+func New(ks jwks.JSONWebKeySet, opts ...Option) *Authorizer {
+	return createAuthorizer(ks, readOptions(opts))
+}
+
+// Handler creates a new Authorizer handler.
+func Handler(ks jwks.JSONWebKeySet, next http.Handler, options ...Option) http.Handler {
+	o := readOptions(options)
+	return createAuthorizer(ks, o).Handler(next, o.handlerOptions...)
+}
+
+// HandlerFunc creates a new Authorizer with an http.HandlerFunc.
+func HandlerFunc(ks jwks.JSONWebKeySet, next http.HandlerFunc, options ...Option) http.HandlerFunc {
+	o := readOptions(options)
+	return createAuthorizer(ks, o).Handler(next, o.handlerOptions...).ServeHTTP
+}
+
+// Middleware returns an http middleware function.
+func Middleware(ks jwks.JSONWebKeySet, options ...Option) func(http.Handler) http.Handler {
+	o := readOptions(options)
+	return createAuthorizer(ks, o).Middleware(o.handlerOptions...)
+}
+
+// Handler creates a new Authorizer handler.
+func (a *Authorizer) Handler(next http.Handler, opts ...HandlerOption) http.Handler {
+	h := &handler{
+		Authorizer: a,
+		next:       next,
+	}
+
+	for _, apply := range opts {
+		apply(h)
+	}
+
+	return h
+}
+
+// Middleware returns an http middleware function.
+func (a *Authorizer) Middleware(opts ...HandlerOption) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return a.Handler(next, opts...)
+	}
+}
+
+func (a *Authorizer) keyfunc(token *jwt.Token) (interface{}, error) {
+	keyID, _ := token.Header["kid"].(string)
+	key, err := a.keys.Key(keyID)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(a.algs) == 0 {
+		return key.Key, nil
+	}
+
+	alg, _ := token.Header["alg"].(string)
+	for _, algo := range a.algs {
+		if string(algo) == alg {
+			return key.Key, nil
+		}
+	}
+
+	return nil, ErrBadAlgorithm
+}
+
+// Validate validates a token.
 func (a *Authorizer) Validate(token string) (map[string]interface{}, error) {
 	claims := make(jwt.MapClaims)
 	if _, err := jwt.ParseWithClaims(token, claims, a.keyfunc); err != nil {
 		return nil, err
 	}
 
-	if a.Issuer != "" && !claims.VerifyIssuer(a.Issuer, true) {
+	if a.iss != "" && !claims.VerifyIssuer(a.iss, true) {
 		return claims, ErrInvalidIssuer
 	}
 
-	if a.Audience != "" && !verifyAud(claims["aud"], a.Audience) {
+	if a.aud != "" && !verifyAud(claims["aud"], a.aud) {
 		return claims, ErrInvalidAudience
 	}
 
@@ -254,37 +346,6 @@ func (a *Authorizer) prime(ctx context.Context) {
 	defer a.mu.RUnlock()
 
 	a.cache[res.token] = res
-}
-
-// ServerHTTP authenticates the HTTP request.
-func (a *Authorizer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	defer func() {
-		a.next.ServeHTTP(w, r.WithContext(ctx))
-	}()
-
-	token, err := a.token(r)
-	if err != nil {
-		ctx = setError(ctx, err)
-		return
-	}
-
-	if res := a.check(token); res != nil {
-		ctx = setResult(ctx, res)
-		return
-	}
-
-	ctx = setToken(ctx, token)
-
-	claims, err := a.Validate(token)
-	if err != nil {
-		ctx = setError(ctx, err)
-		return
-	}
-
-	ctx = setClaims(ctx, claims)
-
-	a.prime(ctx)
 }
 
 // ErrorHandler returns a http.Handler that handles authorizer errors.
